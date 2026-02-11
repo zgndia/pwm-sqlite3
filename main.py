@@ -216,33 +216,37 @@ commands = {
     "rm": remove_login
 }
 
-system("clear")
-initialize_database()
+def main():
+    system("clear")
+    initialize_database()
 
-try:
-    while True:
-        raw_in = input(f"\n> ").strip()
-        if not raw_in: continue
-        
-        parts = raw_in.split()
-        if parts[0] != pacname:
-            print(f"Unrecognized command. Did you mean '{pacname} --help'?")
-            continue
-        
-        if len(parts) < 2:
-            help_menu()
-            continue
+    try:
+        while True:
+            raw_in = input(f"\n> ").strip()
+            if not raw_in: continue
+            
+            parts = raw_in.split()
+            if parts[0] != pacname:
+                print(f"Unrecognized command. Did you mean '{pacname} --help'?")
+                continue
+            
+            if len(parts) < 2:
+                help_menu()
+                continue
 
-        cmd = parts[1].removeprefix("--")
-        if cmd in commands:
-            commands[cmd]()
-        elif cmd == "exit":
-            break
-        else:
-            print("Unknown flag. try `pwm --help` to see commands.")
-except KeyboardInterrupt:
-    print("\nGoodbye!")
-finally:
-    # Final memory wipe of the global key
-    globalkey = None
-    con.close()
+            cmd = parts[1].removeprefix("--")
+            if cmd in commands:
+                commands[cmd]()
+            elif cmd == "exit":
+                break
+            else:
+                print("Unknown flag. try `pwm --help` to see commands.")
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
+    finally:
+        # Final memory wipe of the global key
+        globalkey = None
+        con.close()
+
+if __name__ == "__main__":
+    main()
