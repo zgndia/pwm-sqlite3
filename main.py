@@ -1,7 +1,7 @@
 import sqlite3
 import base64
-import hashlib
 import os
+import hashlib
 import sys
 import gc  # Added for memory management
 from os import system
@@ -87,27 +87,28 @@ def ask_for_master_pass(mode="login"):
                 continue
             conf = input("Are you sure? This will be your encryption key. Y/n: ")
             if conf.lower() == 'y' or conf == '':
-                # Generate a unique salt for this user
                 new_salt = os.urandom(16)
-                globalkey = get_key(mpass, new_salt)
-                cur.execute("INSERT INTO master VALUES (?, ?)", (globalkey, new_salt))
-                con.commit()
+                # This is our actual encryption key
+                globalkey = get_key(mpass, new_salt) 
                 
-                # Memory management: wipe mpass
+                # We store a HASH of the key for verification, NOT the key itself
+                verification_hash = hashlib.sha256(globalkey).digest()
+                
+                cur.execute("INSERT INTO master VALUES (?, ?)", (verification_hash, new_salt))
+                con.commit()
                 mpass = None
-                del mpass
                 break
         else:
             mpass = get_masked_input("Enter master password: ")
             row = cur.execute("SELECT masterpassword, salt FROM master").fetchone()
             if row:
-                stored_hash, stored_salt = row
-                attempt = get_key(mpass, stored_salt)
-                
-                if attempt == stored_hash:
-                    globalkey = attempt
+                stored_verification, stored_salt = row
+                # Derive the key from what the user just typed
+                attempt_key = get_key(mpass, stored_salt)
+                # Hash the attempt to see if it matches the stored verification
+                if hashlib.sha256(attempt_key).digest() == stored_verification:
+                    globalkey = attempt_key
                     print("Access Granted!")
-                    # Wipe plain text password
                     mpass = None
                     gc.collect() 
                     break
