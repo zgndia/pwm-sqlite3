@@ -10,7 +10,12 @@ Simply type `pwm` or `pwm --help` into the terminal to see the commands.
 This program uses [end to end encryption](https://en.wikipedia.org/wiki/End-to-end_encryption); meaning the program itself doesn't know your master password, and your login credentials. Your master password acts like a key for the encrypted vault created by python's built in [sqlite3](https://docs.python.org/3/library/sqlite3.html). The data inside of the `PasswordManager.db` makes no sense without your master password.
 
 ![Your data without your master password](examples/insideofdb.png)
+
+FIGURE 1: Your data is gibberish to the human eyes inside of the .db file.
+
 ![Your data with your master password](examples/insideofprog.png)
+
+FIGURE 2: You can see what you actually put before once you enter your master password through the program.
 
 ### How the program checks what your master password is without knowing what it is
 The program asks for your master password when you launch the program for the very first time. When yo input your password, the program stores the hashed version of your password, using your password as a "key" for hashing it. So that exact key has to be typed into the program to get to that specific hash which happens to be your master password. No one else will not have the same hashed version as you as well. Since that result is hashed together with something called "salt" making your version unique. Read more about salting in cryptography [here](https://en.wikipedia.org/wiki/Salt_(cryptography)).
