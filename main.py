@@ -10,10 +10,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
 
-pacname = "pwm"
-con = sqlite3.connect("PasswordManager.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'allowance_tracker.db')
+PACNAME = "pwm"
+MASTERPASSWORD = None
+con = sqlite3.connect(DB_PATH)
 cur = con.cursor()
-globalkey = None
 
 def get_masked_input(prompt=""):
     print(prompt, end="", flush=True)
@@ -66,7 +68,6 @@ def get_key(password: str, salt: bytes) -> bytes:
 # --- DATABASE LOGIC ---
 def initialize_database() -> None:
     cur.execute("CREATE TABLE IF NOT EXISTS login(platform BLOB, username BLOB, password BLOB)")
-    # Updated table schema to include salt
     cur.execute("CREATE TABLE IF NOT EXISTS master(masterpassword BLOB, salt BLOB)")
     con.commit()
 
@@ -78,21 +79,21 @@ def initialize_database() -> None:
         ask_for_master_pass("login")
 
 def ask_for_master_pass(mode="login"):
-    global globalkey
+    global MASTERPASSWORD
     while True:
         if mode == "register":
-            mpass = get_masked_input("Pick a master password (min 9 chars): ")
-            if len(mpass) < 9: 
+            mpass = get_masked_input("Pick a master password (min 8 chars): ")
+            if len(mpass) < 7: 
                 print("Too short!")
                 continue
             conf = input("Are you sure? This will be your encryption key. Y/n: ")
             if conf.lower() == 'y' or conf == '':
                 new_salt = os.urandom(16)
                 # This is our actual encryption key
-                globalkey = get_key(mpass, new_salt) 
+                MASTERPASSWORD = get_key(mpass, new_salt) 
                 
                 # We store a HASH of the key for verification, NOT the key itself
-                verification_hash = hashlib.sha256(globalkey).digest()
+                verification_hash = hashlib.sha256(MASTERPASSWORD).digest()
                 
                 cur.execute("INSERT INTO master VALUES (?, ?)", (verification_hash, new_salt))
                 con.commit()
@@ -107,7 +108,7 @@ def ask_for_master_pass(mode="login"):
                 attempt_key = get_key(mpass, stored_salt)
                 # Hash the attempt to see if it matches the stored verification
                 if hashlib.sha256(attempt_key).digest() == stored_verification:
-                    globalkey = attempt_key
+                    MASTERPASSWORD = attempt_key
                     print("Access Granted!")
                     mpass = None
                     gc.collect() 
@@ -116,7 +117,7 @@ def ask_for_master_pass(mode="login"):
 
 # --- CRUD OPERATIONS ---
 def insert_login(platform, username, password) -> None:
-    f = Fernet(globalkey)
+    f = Fernet(MASTERPASSWORD)
     cur.execute("INSERT INTO login VALUES (?, ?, ?)", (
         f.encrypt(platform.encode()), 
         f.encrypt(username.encode()), 
@@ -132,18 +133,18 @@ def delete_login(p_enc, u_enc, pw_enc):
 
 # --- COMMAND FUNCTIONS ---
 def help_menu():
-    print(f"\n--- {pacname.upper()} HELP ---")
+    print(f"\n--- {PACNAME.upper()} HELP ---")
     print("--add  : Add a login")
     print("--logs : Show all logins")
     print("--rm   : Remove a login")
     print("--exit : Quit")
 
 def show_logins():
-    f = Fernet(globalkey)
+    f = Fernet(MASTERPASSWORD)
     logs = cur.execute("SELECT platform, username, password FROM login").fetchall()
     if not logs: print("No logins saved."); return
     
-    print(f"\n--- {pacname.upper()} LOGINS ---")
+    print(f"\n--- {PACNAME.upper()} LOGINS ---")
     for log in logs:
         p = f.decrypt(log[0]).decode()
         u = f.decrypt(log[1]).decode()
@@ -172,7 +173,7 @@ def add_login():
     p = u = pw = None # Memory wipe
 
 def remove_login():
-    f = Fernet(globalkey)
+    f = Fernet(MASTERPASSWORD)
     search = input("Enter platform name to search for deletion: ").lower()
     logs = cur.execute("SELECT platform, username, password FROM login").fetchall()
     
@@ -226,8 +227,8 @@ def main():
             if not raw_in: continue
             
             parts = raw_in.split()
-            if parts[0] != pacname:
-                print(f"Unrecognized command. Did you mean '{pacname} --help'?")
+            if parts[0] != PACNAME:
+                print(f"Unrecognized command. Did you mean '{PACNAME} --help'?")
                 continue
             
             if len(parts) < 2:
@@ -245,7 +246,7 @@ def main():
         print("\nGoodbye!")
     finally:
         # Final memory wipe of the global key
-        globalkey = None
+        MASTERPASSWORD = None
         con.close()
 
 if __name__ == "__main__":
