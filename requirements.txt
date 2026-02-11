@@ -1,1 +1,6 @@
+# --- Core Encryption ---
+# Used for Fernet (AES-128) and PBKDF2 key derivation
 cryptography==46.0.4
+
+# Python Version: 3.14.2
+# Initial tests run from CachyOS Linux
