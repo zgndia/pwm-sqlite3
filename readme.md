@@ -1,5 +1,5 @@
 # About
-pwm-sqlite3 is a password manager that uses End to End Encryption (E2EE) that manages your login credentials securely. No one other than you including the program itself has access to that credentials.
+pwm-sqlite3 is a password manager that uses End to End Encryption (E2EE) that manages your account credentials securely. No one other than you *including* the program itself has access to those credentials.
 
 # Installation
 1. Clone this repo or download main.py and requirements.txt separately
