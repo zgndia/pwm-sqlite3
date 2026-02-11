@@ -3,7 +3,7 @@ import base64
 import os
 import hashlib
 import sys
-import gc  # Added for memory management
+import gc
 from os import system
 from difflib import SequenceMatcher
 from cryptography.hazmat.primitives import hashes
@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, 'allowance_tracker.db')
+DB_PATH = os.path.join(BASE_DIR, 'PasswordManager.db')
 PACNAME = "pwm"
 MASTERPASSWORD = None
 con = sqlite3.connect(DB_PATH)
@@ -218,36 +218,59 @@ commands = {
 }
 
 def main():
-    system("clear")
+    # Only clear screen if not being used as a one-off CLI tool
+    if len(sys.argv) == 1:
+        system("clear")
+    
     initialize_database()
 
+    # --- CLI ARGUMENT HANDLING ---
+    # This allows: python main.py --logs
+    if len(sys.argv) > 1:
+        flag = sys.argv[1].removeprefix("--")
+        if flag in commands:
+            commands[flag]()
+            cleanup_and_exit()
+        elif flag == "exit":
+            cleanup_and_exit()
+        else:
+            print(f"Unknown flag: --{flag}")
+            help_menu()
+            cleanup_and_exit()
+
+    # --- INTERACTIVE LOOP ---
     try:
         while True:
             raw_in = input(f"\n> ").strip()
             if not raw_in: continue
             
             parts = raw_in.split()
-            if parts[0] != PACNAME:
-                print(f"Unrecognized command. Did you mean '{PACNAME} --help'?")
-                continue
             
-            if len(parts) < 2:
-                help_menu()
-                continue
+            # Allow just typing "--logs" or "pwm --logs"
+            if parts[0] == PACNAME:
+                if len(parts) < 2:
+                    help_menu()
+                    continue
+                cmd = parts[1].removeprefix("--")
+            else:
+                cmd = parts[0].removeprefix("--")
 
-            cmd = parts[1].removeprefix("--")
             if cmd in commands:
                 commands[cmd]()
-            elif cmd == "exit":
+            elif cmd == "exit" or cmd == "quit":
                 break
             else:
-                print("Unknown flag. try `pwm --help` to see commands.")
+                print(f"Unknown command. Try '{PACNAME} --help'")
     except KeyboardInterrupt:
         print("\nGoodbye!")
     finally:
-        # Final memory wipe of the global key
-        MASTERPASSWORD = None
-        con.close()
+        cleanup_and_exit()
+
+def cleanup_and_exit():
+    global MASTERPASSWORD
+    MASTERPASSWORD = None
+    con.close()
+    sys.exit()
 
 if __name__ == "__main__":
     main()
