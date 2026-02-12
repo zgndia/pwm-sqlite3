@@ -36,6 +36,11 @@ def get_masked_input(prompt=""):
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
+        # Handle Keyboard Interrupt (Ctrl + C)
+        if char == '\x03':
+            print("^C")
+            raise KeyboardInterrupt
+
         if char == '\r' or char == '\n':  # Enter key
             print()
             break
@@ -48,6 +53,7 @@ def get_masked_input(prompt=""):
             password += char
             sys.stdout.write('*')
             sys.stdout.flush()
+            
     return password
 
 # --- CORE CRYPTO ---
@@ -82,7 +88,11 @@ def ask_for_master_pass(mode="login"):
     global MASTERPASSWORD
     while True:
         if mode == "register":
-            mpass = get_masked_input("Pick a master password (min 8 chars): ")
+            try:
+                mpass = get_masked_input("Pick a master password (min 8 chars): ")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled by user.")
+                sys.exit(0)
             if len(mpass) < 7: 
                 print("Too short!")
                 continue
@@ -100,7 +110,11 @@ def ask_for_master_pass(mode="login"):
                 mpass = None
                 break
         else:
-            mpass = get_masked_input("Enter master password: ")
+            try:
+                mpass = get_masked_input("Enter master password: ")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled by user.")
+                sys.exit(0)
             row = cur.execute("SELECT masterpassword, salt FROM master").fetchone()
             if row:
                 stored_verification, stored_salt = row
