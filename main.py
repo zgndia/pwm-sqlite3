@@ -6,6 +6,7 @@ import sys
 import gc
 from os import system
 from difflib import SequenceMatcher
+from argon2 import PasswordHasher, exceptions
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
@@ -14,8 +15,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'PasswordManager.db')
 PACNAME = "pwm"
 MASTERPASSWORD = None
+
+# THE HARDCODED PEPPER
+# If you change this, you lose access to your current database.
+PEPPER = "7tQHcXzTGkDwaRWkcDd8rmDhgMvahR9w4dC3qTCtqDPp2D4DBBUqrHcWHk5YFXM4HhB8fRBMv6aWc5MvHj7SemV5xWGVVyBgbV546q2KRk5UAYZENnUkm9BvuahwpS73"
+
 con = sqlite3.connect(DB_PATH)
 cur = con.cursor()
+
+# Argon2 Config (Memory-hard for protection against GPU cracking)
+ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32)
 
 def get_masked_input(prompt=""):
     print(prompt, end="", flush=True)
@@ -57,18 +66,17 @@ def get_masked_input(prompt=""):
     return password
 
 # --- CORE CRYPTO ---
-def get_key(password: str, salt: bytes) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=480000,
-    )
-    raw_key = kdf.derive(password.encode('utf-8'))
-    fernet_key = base64.urlsafe_b64encode(raw_key)
+def get_key(password: str) -> bytes:
+    """Derives the Fernet key using the Master Password + Hardcoded Pepper."""
+    peppered_pass = (password + PEPPER).encode()
+    # We use Argon2 to generate the raw key material
+    raw_hash = ph.hash(peppered_pass).encode()
+    # We use SHA256 to ensure a consistent 32-byte length for Fernet
+    key_32 = hashlib.sha256(raw_hash).digest()
+    fernet_key = base64.urlsafe_b64encode(key_32)
     
     # Memory management: Clean up raw bytes
-    del raw_key
+    del key_32
     return fernet_key
 
 # --- DATABASE LOGIC ---
@@ -98,14 +106,15 @@ def ask_for_master_pass(mode="login"):
                 continue
             conf = input("Are you sure? This will be your encryption key. Y/n: ")
             if conf.lower() == 'y' or conf == '':
-                new_salt = os.urandom(16)
-                # This is our actual encryption key
-                MASTERPASSWORD = get_key(mpass, new_salt) 
+                # 1. Verification Hash (Stored in masterpassword column)
+                verification_string = ph.hash(mpass + PEPPER)
+                # 2. Derive the actual encryption key
+                MASTERPASSWORD = get_key(mpass) 
+                # 3. Create a Canary (Stored in salt column)
+                f = Fernet(MASTERPASSWORD)
+                canary = f.encrypt(b"vault_is_unlocked")
                 
-                # We store a HASH of the key for verification, NOT the key itself
-                verification_hash = hashlib.sha256(MASTERPASSWORD).digest()
-                
-                cur.execute("INSERT INTO master VALUES (?, ?)", (verification_hash, new_salt))
+                cur.execute("INSERT INTO master VALUES (?, ?)", (verification_string.encode(), canary))
                 con.commit()
                 mpass = None
                 break
@@ -117,16 +126,21 @@ def ask_for_master_pass(mode="login"):
                 sys.exit(0)
             row = cur.execute("SELECT masterpassword, salt FROM master").fetchone()
             if row:
-                stored_verification, stored_salt = row
-                # Derive the key from what the user just typed
-                attempt_key = get_key(mpass, stored_salt)
-                # Hash the attempt to see if it matches the stored verification
-                if hashlib.sha256(attempt_key).digest() == stored_verification:
-                    MASTERPASSWORD = attempt_key
-                    print("Access Granted!")
-                    mpass = None
-                    gc.collect() 
-                    break
+                stored_hash, stored_canary = row
+                try:
+                    # Check password validity against Argon2 hash
+                    ph.verify(stored_hash.decode(), mpass + PEPPER)
+                    # Derive key and check if it can actually decrypt the Canary
+                    attempt_key = get_key(mpass)
+                    f = Fernet(attempt_key)
+                    if f.decrypt(stored_canary) == b"vault_is_unlocked":
+                        MASTERPASSWORD = attempt_key
+                        print("Access Granted!")
+                        mpass = None
+                        gc.collect() 
+                        break
+                except (exceptions.VerifyMismatchError, Exception):
+                    pass
             print("Incorrect password.")
 
 # --- CRUD OPERATIONS ---
@@ -179,6 +193,7 @@ def add_login():
     print(f"Password: {'*' * len(pw)}")
     
     confirm = input("Save this login? Y/n: ")
+    system("clear")
     if confirm.lower() == 'y' or confirm == '':
         insert_login(p, u, pw)
         print("Successfully saved!")
@@ -214,6 +229,8 @@ def remove_login():
         print(f"\nWARNING: You are about to delete the login for [{target['name']}].")
         confirm = input("Are you absolutely sure? Y/n: ")
         
+        system("clear")
+
         if confirm.lower() == 'y' or confirm == '':
             raw_data = target["raw"]
             delete_login(raw_data[0], raw_data[1], raw_data[2])
@@ -273,6 +290,8 @@ def main():
                 commands[cmd]()
             elif cmd == "exit" or cmd == "quit":
                 break
+            elif cmd == "clear":
+                system("clear")
             else:
                 print(f"Unknown command. Try '{PACNAME} --help'")
     except KeyboardInterrupt:
