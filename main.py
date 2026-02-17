@@ -1,60 +1,94 @@
 import sqlite3
 import base64
 import os
-import hashlib
 import sys
 import gc
+import secrets
+import hashlib
 from os import system
 from difflib import SequenceMatcher
+from typing import Optional
 from argon2 import PasswordHasher, exceptions
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
+# ────────────────────────────────────────────────
+# Configuration
+# ────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'PasswordManager.db')
+PEPPER_FILE = os.path.join(BASE_DIR, 'pepper.key')
 PACNAME = "pwm"
-MASTERPASSWORD = None
 
-# THE HARDCODED PEPPER
-# If you change this, you lose access to your current database.
-PEPPER = "7tQHcXzTGkDwaRWkcDd8rmDhgMvahR9w4dC3qTCtqDPp2D4DBBUqrHcWHk5YFXM4HhB8fRBMv6aWc5MvHj7SemV5xWGVVyBgbV546q2KRk5UAYZENnUkm9BvuahwpS73"
+MASTER_KEY: Optional[bytes] = None
 
-con = sqlite3.connect(DB_PATH)
-cur = con.cursor()
+# ────────────────────────────────────────────────
+# Pepper (persistent, generated once)
+# ────────────────────────────────────────────────
+def load_or_create_pepper() -> str:
+    if os.path.exists(PEPPER_FILE):
+        with open(PEPPER_FILE, "r", encoding="utf-8") as f:
+            pepper = f.read().strip()
+        if len(pepper) < 64:
+            raise RuntimeError("pepper.key file is corrupted (too short)")
+        return pepper
 
-# Argon2 Config (Memory-hard for protection against GPU cracking)
+    pepper = secrets.token_hex(64)
+    try:
+        with open(PEPPER_FILE, "w", encoding="utf-8") as f:
+            f.write(pepper)
+        if os.name != 'nt':
+            os.chmod(PEPPER_FILE, 0o600)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to create {PEPPER_FILE}: {exc}")
+
+    print(f"Generated new pepper and saved to {PEPPER_FILE}")
+    return pepper
+
+PEPPER = load_or_create_pepper()
+
+# ────────────────────────────────────────────────
+# Crypto setup
+# ────────────────────────────────────────────────
 ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32)
 
-def get_masked_input(prompt=""):
+def get_key(password: str) -> bytes:
+    peppered = (password + PEPPER).encode()
+    raw_hash = ph.hash(peppered).encode()
+    key_32 = hashlib.sha256(raw_hash).digest()
+    fernet_key = base64.urlsafe_b64encode(key_32)
+    del raw_hash, key_32
+    gc.collect()
+    return fernet_key
+
+# ────────────────────────────────────────────────
+# Masked input (cross-platform)
+# ────────────────────────────────────────────────
+def get_masked_input(prompt: str = "") -> str:
     print(prompt, end="", flush=True)
     password = ""
     while True:
-        # Check if running on Windows
         if os.name == 'nt':
             import msvcrt
-            char = msvcrt.getch().decode('utf-8')
+            char = msvcrt.getch().decode('utf-8', errors='ignore')
         else:
-            # Linux/Mac logic
             import tty, termios
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
             try:
-                tty.setraw(sys.stdin.fileno())
+                tty.setraw(fd)
                 char = sys.stdin.read(1)
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-        # Handle Keyboard Interrupt (Ctrl + C)
-        if char == '\x03':
+        if char in ('\x03', '\x04'):  # Ctrl+C / Ctrl+D
             print("^C")
             raise KeyboardInterrupt
 
-        if char == '\r' or char == '\n':  # Enter key
+        if char in ('\r', '\n'):
             print()
             break
-        elif char == '\x08' or char == '\x7f':  # Backspace
-            if len(password) > 0:
+        elif char in ('\x08', '\x7f'):  # Backspace
+            if password:
                 password = password[:-1]
                 sys.stdout.write('\b \b')
                 sys.stdout.flush()
@@ -62,248 +96,307 @@ def get_masked_input(prompt=""):
             password += char
             sys.stdout.write('*')
             sys.stdout.flush()
-            
+
     return password
 
-# --- CORE CRYPTO ---
-def get_key(password: str) -> bytes:
-    """Derives the Fernet key using the Master Password + Hardcoded Pepper."""
-    peppered_pass = (password + PEPPER).encode()
-    # We use Argon2 to generate the raw key material
-    raw_hash = ph.hash(peppered_pass).encode()
-    # We use SHA256 to ensure a consistent 32-byte length for Fernet
-    key_32 = hashlib.sha256(raw_hash).digest()
-    fernet_key = base64.urlsafe_b64encode(key_32)
-    
-    # Memory management: Clean up raw bytes
-    del key_32
-    return fernet_key
+# ────────────────────────────────────────────────
+# Database helpers
+# ────────────────────────────────────────────────
+def get_connection() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH)
 
-# --- DATABASE LOGIC ---
-def initialize_database() -> None:
+def initialize_database(con: sqlite3.Connection):
+    cur = con.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS login(platform BLOB, username BLOB, password BLOB)")
-    cur.execute("CREATE TABLE IF NOT EXISTS master(masterpassword BLOB, salt BLOB)")
+    cur.execute("CREATE TABLE IF NOT EXISTS master(verification BLOB, canary BLOB)")
     con.commit()
 
-    row = cur.execute("SELECT masterpassword FROM master").fetchone()
-    if not row:
-        print("No master password found.")
-        ask_for_master_pass("register")
-    else:
-        ask_for_master_pass("login")
+# ────────────────────────────────────────────────
+# Authentication
+# ────────────────────────────────────────────────
+def ask_for_master_pass(mode: str = "login") -> None:
+    global MASTER_KEY
+    con = get_connection()
+    cur = con.cursor()
 
-def ask_for_master_pass(mode="login"):
-    global MASTERPASSWORD
     while True:
         if mode == "register":
             try:
                 mpass = get_masked_input("Pick a master password (min 8 chars): ")
             except KeyboardInterrupt:
-                print("\nOperation cancelled by user.")
+                print("\nOperation cancelled.")
                 sys.exit(0)
-            if len(mpass) < 7: 
-                print("Too short!")
+
+            if len(mpass) < 8:
+                print("Password must be at least 8 characters.")
                 continue
-            conf = input("Are you sure? This will be your encryption key. Y/n: ")
-            if conf.lower() == 'y' or conf == '':
-                # 1. Verification Hash (Stored in masterpassword column)
-                verification_string = ph.hash(mpass + PEPPER)
-                # 2. Derive the actual encryption key
-                MASTERPASSWORD = get_key(mpass) 
-                # 3. Create a Canary (Stored in salt column)
-                f = Fernet(MASTERPASSWORD)
-                canary = f.encrypt(b"vault_is_unlocked")
-                
-                cur.execute("INSERT INTO master VALUES (?, ?)", (verification_string.encode(), canary))
-                con.commit()
-                mpass = None
-                break
-        else:
+            
+            try:
+                re_enter = get_masked_input("Re-enter your master password: ")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled.")
+                sys.exit(0)
+            
+            if re_enter != mpass:
+                print("The passwords don't match.")
+                continue
+
+            conf = input("Confirm this is your master password? [Y/n]: ").strip().lower()
+            if conf not in ('', 'y', 'yes'):
+                print("Cancelled.")
+                continue
+
+            verification = ph.hash(mpass + PEPPER)
+            key = get_key(mpass)
+            f = Fernet(key)
+            canary = f.encrypt(b"vault_is_unlocked")
+
+            cur.execute("INSERT INTO master VALUES (?, ?)", (verification.encode(), canary))
+            con.commit()
+            MASTER_KEY = key
+            print("Master password registered.")
+            mpass = None
+            break
+
+        else:  # login
             try:
                 mpass = get_masked_input("Enter master password: ")
             except KeyboardInterrupt:
-                print("\nOperation cancelled by user.")
+                print("\nGoodbye.")
                 sys.exit(0)
-            row = cur.execute("SELECT masterpassword, salt FROM master").fetchone()
-            if row:
-                stored_hash, stored_canary = row
-                try:
-                    # Check password validity against Argon2 hash
-                    ph.verify(stored_hash.decode(), mpass + PEPPER)
-                    # Derive key and check if it can actually decrypt the Canary
-                    attempt_key = get_key(mpass)
-                    f = Fernet(attempt_key)
-                    if f.decrypt(stored_canary) == b"vault_is_unlocked":
-                        MASTERPASSWORD = attempt_key
-                        print("Access Granted!")
-                        mpass = None
-                        gc.collect() 
-                        break
-                except (exceptions.VerifyMismatchError, Exception):
-                    pass
-            print("Incorrect password.")
 
-# --- CRUD OPERATIONS ---
-def insert_login(platform, username, password) -> None:
-    f = Fernet(MASTERPASSWORD)
+            row = cur.execute("SELECT verification, canary FROM master").fetchone()
+            if not row:
+                print("No master password set. Run in register mode or use --register.")
+                sys.exit(1)
+
+            stored_hash, stored_canary = row
+
+            try:
+                ph.verify(stored_hash.decode(), mpass + PEPPER)
+                attempt_key = get_key(mpass)
+                f = Fernet(attempt_key)
+                if f.decrypt(stored_canary) == b"vault_is_unlocked":
+                    MASTER_KEY = attempt_key
+                    print("Access granted.")
+                    mpass = None
+                    gc.collect()
+                    break
+            except (exceptions.VerifyMismatchError, InvalidToken):
+                print("Incorrect password.")
+
+    con.close()
+
+# ────────────────────────────────────────────────
+# CRUD
+# ────────────────────────────────────────────────
+def insert_login(platform: str, username: str, password: str) -> None:
+    if MASTER_KEY is None:
+        raise RuntimeError("Not unlocked")
+    con = get_connection()
+    cur = con.cursor()
+    f = Fernet(MASTER_KEY)
     cur.execute("INSERT INTO login VALUES (?, ?, ?)", (
-        f.encrypt(platform.encode()), 
-        f.encrypt(username.encode()), 
+        f.encrypt(platform.encode()),
+        f.encrypt(username.encode()),
         f.encrypt(password.encode())
     ))
     con.commit()
-    gc.collect() # Clean up encryption remnants
+    con.close()
+    gc.collect()
 
-def delete_login(p_enc, u_enc, pw_enc):
-    cur.execute("DELETE FROM login WHERE platform = ? AND username = ? AND password = ?", 
+def delete_login(p_enc: bytes, u_enc: bytes, pw_enc: bytes) -> bool:
+    con = get_connection()
+    cur = con.cursor()
+    cur.execute("DELETE FROM login WHERE platform = ? AND username = ? AND password = ?",
                 (p_enc, u_enc, pw_enc))
+    changed = cur.rowcount > 0
     con.commit()
+    con.close()
+    gc.collect()
+    return changed
 
-# --- COMMAND FUNCTIONS ---
+# ────────────────────────────────────────────────
+# UI commands
+# ────────────────────────────────────────────────
 def help_menu():
     print(f"\n--- {PACNAME.upper()} HELP ---")
-    print("--add  : Add a login")
-    print("--logs : Show all logins")
-    print("--rm   : Remove a login")
-    print("--exit : Quit")
+    print("Commands:")
+    print("  add          Add a new login")
+    print("  logs / logins  List all stored logins")
+    print("  rm           Remove a login (fuzzy search)")
+    print("  clear        Clear the screen")
+    print("  exit / quit  Exit the program")
+    print("  help / h     Show this help")
 
 def show_logins():
-    f = Fernet(MASTERPASSWORD)
-    logs = cur.execute("SELECT platform, username, password FROM login").fetchall()
-    if not logs: print("No logins saved."); return
-    
-    print(f"\n--- {PACNAME.upper()} LOGINS ---")
-    for log in logs:
-        p = f.decrypt(log[0]).decode()
-        u = f.decrypt(log[1]).decode()
-        pw = f.decrypt(log[2]).decode()
-        print(f"[{p}] User: {u} | Pass: {pw}")
-        # Help garbage collector
-        p = u = pw = None 
+    if MASTER_KEY is None:
+        print("Vault is locked.")
+        return
+    con = get_connection()
+    cur = con.cursor()
+    f = Fernet(MASTER_KEY)
+    rows = cur.execute("SELECT platform, username, password FROM login").fetchall()
+    con.close()
+
+    if not rows:
+        print("No logins saved yet.")
+        return
+
+    print(f"\n--- {PACNAME.upper()} STORED LOGINS ---")
+    for row in rows:
+        try:
+            p = f.decrypt(row[0]).decode()
+            u = f.decrypt(row[1]).decode()
+            pw = f.decrypt(row[2]).decode()
+            print(f"  [{p:20}]  user: {u:25}  pass: {pw}")
+        except InvalidToken:
+            print("  [Decryption failed — possible corruption]")
     gc.collect()
 
 def add_login():
-    p = input("Platform: ")
-    u = input("Username: ")
-    pw = input("Password: ")
-    
-    print(f"\nConfirm Login Data:")
-    print(f"Platform: {p}")
-    print(f"Username: {u}")
-    print(f"Password: {'*' * len(pw)}")
-    
-    confirm = input("Save this login? Y/n: ")
-    system("clear")
-    if confirm.lower() == 'y' or confirm == '':
-        insert_login(p, u, pw)
-        print("Successfully saved!")
-    else:
-        print("Action cancelled.")
-    p = u = pw = None # Memory wipe
-
-def remove_login():
-    f = Fernet(MASTERPASSWORD)
-    search = input("Enter platform name to search for deletion: ").lower()
-    logs = cur.execute("SELECT platform, username, password FROM login").fetchall()
-    
-    found = []
-    for row in logs:
-        p_name = f.decrypt(row[0]).decode()
-        u_name = f.decrypt(row[1]).decode()
-        if SequenceMatcher(None, p_name.lower(), search).ratio() > 0.6:
-            found.append({"name": p_name, "user": u_name, "raw": row})
-
-    if not found: 
-        print("No matching platforms found.")
+    if MASTER_KEY is None:
+        print("Vault is locked.")
         return
 
-    print("\n--- Search Results ---")
+    p = input("Platform / service: ").strip()
+    u = input("Username / email:   ").strip()
+    pw = get_masked_input("Password:           ")
+
+    print("\nYou entered:")
+    print(f"  Platform: {p}")
+    print(f"  Username: {u}")
+    print(f"  Password: {'*' * len(pw)}")
+
+    if input("Save? [Y/n]: ").strip().lower() not in ('', 'y', 'yes'):
+        print("Cancelled.")
+        return
+
+    insert_login(p, u, pw)
+    print("Login saved.")
+
+def remove_login():
+    if MASTER_KEY is None:
+        print("Vault is locked.")
+        return
+
+    search = input("Search for platform to remove: ").strip().lower()
+    if not search:
+        print("No search term provided.")
+        return
+
+    con = get_connection()
+    cur = con.cursor()
+    f = Fernet(MASTER_KEY)
+    rows = cur.execute("SELECT platform, username, password FROM login").fetchall()
+    con.close()
+
+    found = []
+    for row in rows:
+        try:
+            name = f.decrypt(row[0]).decode()
+            user = f.decrypt(row[1]).decode()
+            if SequenceMatcher(None, name.lower(), search).ratio() > 0.6:
+                found.append({"name": name, "user": user, "raw": row})
+        except InvalidToken:
+            continue
+
+    if not found:
+        print("No matching entries found.")
+        return
+
+    print("\nMatching entries:")
     for i, item in enumerate(found, 1):
-        print(f"{i}. [{item['name']}] | User: {item['user']}")
-    
+        print(f"{i:2d}. [{item['name']}]  {item['user']}")
+
     try:
-        choice = int(input("\nPick the number to delete: ")) - 1
-        if choice < 0 or choice >= len(found): raise IndexError
-        
-        target = found[choice]
-        print(f"\nWARNING: You are about to delete the login for [{target['name']}].")
-        confirm = input("Are you absolutely sure? Y/n: ")
-        
-        system("clear")
+        idx = int(input("\nNumber to delete: ")) - 1
+        if idx < 0 or idx >= len(found):
+            raise ValueError
+        target = found[idx]
+        print(f"\nDeleting: [{target['name']}] – {target['user']}")
+        if input("Confirm deletion? [y/N]: ").strip().lower() not in ('y', 'yes'):
+            print("Cancelled.")
+            return
 
-        if confirm.lower() == 'y' or confirm == '':
-            raw_data = target["raw"]
-            delete_login(raw_data[0], raw_data[1], raw_data[2])
-            print("Successfully removed!")
+        if delete_login(*target["raw"]):
+            print("Entry removed.")
         else:
-            print("Deletion cancelled.")
+            print("Entry not found (already removed?).")
     except (ValueError, IndexError):
-        print("Invalid selection. Action interrupted.")
+        print("Invalid selection.")
 
-# --- MAIN LOOP ---
+# ────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────
 commands = {
     "help": help_menu, "h": help_menu,
     "add": add_login,
     "logs": show_logins, "logins": show_logins,
-    "rm": remove_login
+    "rm": remove_login,
+    "clear": lambda: system("clear" if os.name != 'nt' else "cls"),
 }
 
+def cleanup():
+    global MASTER_KEY
+    MASTER_KEY = None
+    gc.collect()
+    sys.exit(0)
+
 def main():
-    # Only clear screen if not being used as a one-off CLI tool
     if len(sys.argv) == 1:
-        system("clear")
-    
-    initialize_database()
+        system("clear" if os.name != 'nt' else "cls")
 
-    # --- CLI ARGUMENT HANDLING ---
-    # This allows: python main.py --logs
+    con = get_connection()
+    initialize_database(con)
+    has_master = con.execute("SELECT 1 FROM master").fetchone() is not None
+    con.close()
+
+    # One-shot mode
     if len(sys.argv) > 1:
-        flag = sys.argv[1].removeprefix("--")
-        if flag in commands:
+        flag = sys.argv[1].removeprefix("--").lower()
+        if flag in ("register", "reg"):
+            ask_for_master_pass("register")
+            cleanup()
+        elif flag in commands:
+            if not has_master:
+                print("No master password set. Run --register first.")
+                sys.exit(1)
+            ask_for_master_pass("login")
             commands[flag]()
-            cleanup_and_exit()
-        elif flag == "exit":
-            cleanup_and_exit()
+            cleanup()
         else:
-            print(f"Unknown flag: --{flag}")
+            print(f"Unknown flag: {sys.argv[1]}")
             help_menu()
-            cleanup_and_exit()
+            cleanup()
 
-    # --- INTERACTIVE LOOP ---
+    # Interactive mode
+    if not has_master:
+        print("No master password found.")
+        ask_for_master_pass("register")
+    else:
+        ask_for_master_pass("login")
+
+    print("\nType 'help' for commands.")
+
     try:
         while True:
-            raw_in = input(f"\n> ").strip()
-            if not raw_in: continue
-            
-            parts = raw_in.split()
-            
-            # Allow just typing "--logs" or "pwm --logs"
-            if parts[0] == PACNAME:
-                if len(parts) < 2:
-                    help_menu()
-                    continue
-                cmd = parts[1].removeprefix("--")
-            else:
-                cmd = parts[0].removeprefix("--")
+            line = input(f"{PACNAME}> ").strip()
+            if not line:
+                continue
+            parts = line.split()
+            cmd = parts[0].removeprefix("--").lower()
 
             if cmd in commands:
                 commands[cmd]()
-            elif cmd == "exit" or cmd == "quit":
+            elif cmd in ("exit", "quit", "q"):
                 break
-            elif cmd == "clear":
-                system("clear")
             else:
-                print(f"Unknown command. Try '{PACNAME} --help'")
+                print(f"Unknown command '{cmd}'. Type 'help' for help.")
     except KeyboardInterrupt:
-        print("\nGoodbye!")
+        print("\nInterrupted.")
     finally:
-        cleanup_and_exit()
-
-def cleanup_and_exit():
-    global MASTERPASSWORD
-    MASTERPASSWORD = None
-    con.close()
-    sys.exit()
+        cleanup()
 
 if __name__ == "__main__":
     main()
